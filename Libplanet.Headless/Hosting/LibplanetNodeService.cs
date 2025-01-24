@@ -133,7 +133,7 @@ namespace Libplanet.Headless.Hosting
                             actionLoader),
                     DefaultActionEvaluatorConfiguration _ =>
                         new ActionEvaluator(
-                            _ => blockPolicy.BlockAction,
+                            policyActionsRegistry: blockPolicy.PolicyActionsRegistry,
                             stateStore: StateStore,
                             actionTypeLoader: actionLoader),
                     ForkableActionEvaluatorConfiguration forkableActionEvaluatorConfiguration =>
@@ -199,7 +199,6 @@ namespace Libplanet.Headless.Hosting
             var hostOptions = new Net.Options.HostOptions(Properties.Host, shuffledIceServers, Properties.Port ?? default);
             var swarmOptions = new Net.Options.SwarmOptions
             {
-                BranchpointThreshold = 50,
                 MinimumBroadcastTarget = Properties.MinimumBroadcastTarget,
                 BucketSize = Properties.BucketSize,
                 MaximumPollPeers = Properties.MaximumPollPeers,
@@ -239,7 +238,7 @@ namespace Libplanet.Headless.Hosting
                     ConsensusPrivateKey = Properties.ConsensusPrivateKey,
                     ConsensusWorkers = 500,
                     TargetBlockInterval = TimeSpan.FromMilliseconds(Properties.ConsensusTargetBlockIntervalMilliseconds ?? 7000),
-                    ContextTimeoutOptions = Properties.ContextTimeoutOption,
+                    ContextOption = Properties.ContextOption,
                 };
             }
 
@@ -372,9 +371,6 @@ namespace Libplanet.Headless.Hosting
                     searchDepth: depth,
                     dialTimeout: null,
                     cancellationToken: cancellationToken);
-
-            // We assume the first phase of preloading is BlockHashDownloadState...
-            ((IProgress<BlockSyncState>)PreloadProgress)?.Report(new BlockHashDownloadState());
 
             if (peers.Any())
             {

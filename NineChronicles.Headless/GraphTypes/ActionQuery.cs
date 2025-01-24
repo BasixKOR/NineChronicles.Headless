@@ -3,18 +3,19 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Bencodex;
-using Bencodex.Types;
-using Google.Protobuf.WellKnownTypes;
 using GraphQL;
 using GraphQL.Types;
 using Libplanet.Crypto;
 using Libplanet.Types.Assets;
 using Libplanet.Explorer.GraphTypes;
 using Nekoyume.Action;
-using Nekoyume.Model;
-using Nekoyume.Model.State;
-using Nekoyume.Module;
 using Nekoyume.TableData;
+using Nekoyume.Action.ValidatorDelegation;
+using Nekoyume.Action.Guild.Migration;
+using Lib9c;
+using Nekoyume.Action.Guild;
+using Nekoyume.TypedAddress;
+using System.Globalization;
 
 namespace NineChronicles.Headless.GraphTypes
 {
@@ -29,14 +30,26 @@ namespace NineChronicles.Headless.GraphTypes
 
             Field<ByteStringType>(
                 name: "stake",
-                arguments: new QueryArguments(new QueryArgument<BigIntGraphType>
+                arguments: new QueryArguments(
+                    new QueryArgument<BigIntGraphType>
+                    {
+                        Name = "amount",
+                        Description = "An amount to stake.",
+                    },
+                    new QueryArgument<AddressType>
+                    {
+                        Name = "avatarAddress",
+                        Description = "Address of avatar.",
+                    }),
+                resolve: context =>
                 {
-                    Name = "amount",
-                    Description = "An amount to stake.",
-                }),
-                resolve: context => Encode(
-                    context,
-                    new Stake(context.GetArgument<BigInteger>("amount"))));
+                    var amount = context.GetArgument<BigInteger>("amount");
+                    var avatarAddress = context.GetArgument<Address?>("avatarAddress");
+                    var stake = avatarAddress is not null
+                        ? new Stake(amount, avatarAddress.Value)
+                        : new Stake(amount);
+                    return Encode(context, stake);
+                });
 
             Field<ByteStringType>(
                 name: "claimStakeReward",
@@ -425,35 +438,6 @@ namespace NineChronicles.Headless.GraphTypes
                 }
             );
             Field<NonNullGraphType<ByteStringType>>(
-                "activateAccount",
-                deprecationReason: "Since NCIP-15, it doesn't care account activation.",
-                arguments: new QueryArguments(
-                    new QueryArgument<NonNullGraphType<StringGraphType>>
-                    {
-                        Name = "activationCode",
-                        Description = "Activation code that you've get."
-                    }
-                ),
-                resolve: context =>
-                {
-                    var activationCode = context.GetArgument<string>("activationCode");
-                    var activationKey = ActivationKey.Decode(activationCode);
-                    if (standaloneContext.BlockChain!.GetWorldState().GetLegacyState(activationKey.PendingAddress) is Dictionary dictionary)
-                    {
-                        var pending = new PendingActivationState(dictionary);
-                        var action = activationKey.CreateActivateAccount(pending.Nonce);
-                        if (pending.Verify(action))
-                        {
-                            return Encode(context, action);
-                        }
-
-                        throw new ExecutionError("Failed to verify activateAccount action.");
-                    }
-
-                    throw new InvalidOperationException("BlockChain not found in the context");
-                }
-            );
-            Field<NonNullGraphType<ByteStringType>>(
                 "createAvatar",
                 arguments: new QueryArguments(
                     new QueryArgument<NonNullGraphType<IntGraphType>>
@@ -556,8 +540,178 @@ namespace NineChronicles.Headless.GraphTypes
                         RuneId = runeId,
                         TryCount = tryCount
                     };
+
                     return Encode(context, action);
                 });
+
+            Field<ByteStringType>(
+                name: "promoteValidator",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<StringGraphType>>
+                    {
+                        Description = "Public key of validator.",
+                        Name = "publicKey",
+                    },
+                    new QueryArgument<NonNullGraphType<StringGraphType>>
+                    {
+                        Description = "A string value to be transferred.",
+                        Name = "amount",
+                    }),
+                resolve: context =>
+                {
+                    var currency = FungibleAssetValue.Parse(
+                        Currencies.GuildGold,
+                        context.GetArgument<string>("amount"));
+                    var publicKey = PublicKey.FromHex(
+                        context.GetArgument<string>("publicKey"));
+
+                    return Encode(
+                        context,
+                        new PromoteValidator(
+                            publicKey,
+                            currency));
+                });
+
+            Field<ByteStringType>(
+                name: "unjailValidator",
+                resolve: context => Encode(context, new UnjailValidator()));
+
+            Field<ByteStringType>(
+                name: "delegateValidator",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<StringGraphType>>
+                    {
+                        Description = "A string value of guild gold to delegate.",
+                        Name = "amount",
+                    }),
+                resolve: context =>
+                {
+                    var fav = FungibleAssetValue.Parse(
+                        currency: Currencies.GuildGold,
+                        value: context.GetArgument<string>("amount"));
+                    return Encode(context, new DelegateValidator(fav));
+                });
+
+            Field<ByteStringType>(
+                name: "undelegateValidator",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<StringGraphType>>
+                    {
+                        Description = "A string value of share to undelegate.",
+                        Name = "share",
+                    }),
+                resolve: context =>
+                {
+                    var share = BigInteger.Parse(
+                        value: context.GetArgument<string>("share"),
+                        style: NumberStyles.Number);
+                    return Encode(context, new UndelegateValidator(share));
+                });
+
+            Field<ByteStringType>(
+                name: "migrateDelegationHeight",
+                arguments: new QueryArguments(new QueryArgument<LongGraphType>
+                {
+                    Name = "height",
+                    Description = "An migration height.",
+                }),
+                resolve: context => Encode(
+                    context,
+                    new MigrateDelegationHeight(context.GetArgument<long>("amount"))));
+
+            Field<ByteStringType>(
+                name: "makeGuild",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "validatorAddress",
+                        Description = "The validator address to create a guild."
+                    }),
+                resolve: context =>
+                {
+                    var validatorAddress = context.GetArgument<Address>("validatorAddress");
+                    return Encode(context, new MakeGuild(validatorAddress));
+                });
+
+            Field<ByteStringType>(
+                name: "removeGuild",
+                resolve: context => Encode(context, new RemoveGuild()));
+
+            Field<ByteStringType>(
+                name: "joinGuild",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "guildAddress",
+                        Description = "The guild address to join."
+                    }),
+                resolve: context =>
+                {
+                    var address = context.GetArgument<Address>("guildAddress");
+                    var guildAddress = new GuildAddress(address);
+                    return Encode(context, new JoinGuild(guildAddress));
+                });
+
+            Field<ByteStringType>(
+                name: "quitGuild",
+                resolve: context => Encode(context, new QuitGuild()));
+
+            Field<ByteStringType>(
+                name: "moveGuild",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "guildAddress",
+                        Description = "The guild address to move."
+                    }),
+                resolve: context =>
+                {
+                    var address = context.GetArgument<Address>("guildAddress");
+                    var guildAddress = new GuildAddress(address);
+                    return Encode(context, new MoveGuild(guildAddress));
+                });
+
+            Field<ByteStringType>(
+                name: "banGuildMember",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "agentAddress",
+                        Description = "The agent address to ban."
+                    }),
+                resolve: context =>
+                {
+                    var address = context.GetArgument<Address>("agentAddress");
+                    var agentAddress = new AgentAddress(address);
+                    return Encode(context, new BanGuildMember(agentAddress));
+                });
+
+            Field<ByteStringType>(
+                name: "unbanGuildMember",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "agentAddress",
+                        Description = "The agent address to unban."
+                    }),
+                resolve: context =>
+                {
+                    var address = context.GetArgument<Address>("agentAddress");
+                    var agentAddress = new AgentAddress(address);
+                    return Encode(context, new UnbanGuildMember(agentAddress));
+                });
+
+            Field<ByteStringType>(
+                name: "claimReward",
+                resolve: context => Encode(context, new ClaimReward()));
+
+            Field<ByteStringType>(
+                name: "claimGuildReward",
+                resolve: context => Encode(context, new ClaimGuildReward()));
+
+            Field<ByteStringType>(
+                name: "claimUnbonded",
+                resolve: context => Encode(context, new ClaimUnbonded()));
 
             RegisterHackAndSlash();
             RegisterHackAndSlashSweep();
@@ -571,6 +725,7 @@ namespace NineChronicles.Headless.GraphTypes
             RegisterSummon();
             RegisterClaimItems();
             RegisterRetrieveAvatarAssets();
+            RegisterIssueToken();
 
             Field<NonNullGraphType<CraftQuery>>(
                 name: "craftQuery",

@@ -29,6 +29,12 @@ using NineChronicles.Headless.GraphTypes.States.Models;
 using NineChronicles.Headless.GraphTypes.States.Models.Item;
 using NineChronicles.Headless.GraphTypes.States.Models.Item.Enum;
 using NineChronicles.Headless.GraphTypes.States.Models.Table;
+using Nekoyume.Model.Guild;
+using NineChronicles.Headless.Utils;
+using Nekoyume.Module.Guild;
+using Nekoyume.TypedAddress;
+using Nekoyume.ValidatorDelegation;
+using Nekoyume.Module.ValidatorDelegation;
 
 namespace NineChronicles.Headless.GraphTypes
 {
@@ -250,9 +256,10 @@ namespace NineChronicles.Headless.GraphTypes
             StakeStateType.StakeStateContext? GetStakeState(StateContext ctx, Address agentAddress)
             {
                 var stakeStateAddress = StakeState.DeriveAddress(agentAddress);
-                if (ctx.WorldState.TryGetStakeStateV2(agentAddr: agentAddress, out StakeStateV2 stakeStateV2))
+                if (ctx.WorldState.TryGetStakeState(agentAddr: agentAddress, out StakeState stakeStateV2))
                 {
                     return new StakeStateType.StakeStateContext(
+                        agentAddress,
                         stakeStateV2,
                         stakeStateAddress,
                         ctx.WorldState,
@@ -389,7 +396,7 @@ namespace NineChronicles.Headless.GraphTypes
                     StakeRegularRewardSheet stakeRegularRewardSheet;
                     StakeRegularFixedRewardSheet stakeRegularFixedRewardSheet;
 
-                    if (context.Source.BlockIndex < StakeState.StakeRewardSheetV2Index)
+                    if (context.Source.BlockIndex < LegacyStakeState.StakeRewardSheetV2Index)
                     {
                         stakeRegularRewardSheet = new StakeRegularRewardSheet();
                         //stakeRegularRewardSheet.Set(ClaimStakeReward8.V1.StakeRegularRewardSheetCsv);
@@ -713,6 +720,141 @@ namespace NineChronicles.Headless.GraphTypes
                     var tableName = context.GetArgument<string>("tableName");
                     var cacheKey = Addresses.GetSheetAddress(tableName).ToString();
                     return context.Source.StateMemoryCache.SheetCache.GetSheet(cacheKey);
+                }
+            );
+
+            Field<GuildType>(
+                name: "guild",
+                description: "State for guild.",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "agentAddress",
+                        Description = "Address of agent."
+                    }
+                ),
+                resolve: context =>
+                {
+                    var agentAddress = new AgentAddress(context.GetArgument<Address>("agentAddress"));
+                    var repository = new GuildRepository(new World(context.Source.WorldState), new HallowActionContext { });
+                    if (repository.GetJoinedGuild(agentAddress) is { } guildAddress)
+                    {
+                        var guild = repository.GetGuild(guildAddress);
+                        return GuildType.FromDelegatee(guild);
+                    }
+
+                    return null;
+                }
+            );
+
+            Field<StringGraphType>(
+                name: "share",
+                description: "State for delegation share.",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "agentAddress",
+                        Description = "Address of agent."
+                    },
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "validatorAddress",
+                        Description = "Address of validator."
+                    }
+                ),
+                resolve: context =>
+                {
+                    var agentAddress = new AgentAddress(context.GetArgument<Address>("agentAddress"));
+                    var validatorAddress = context.GetArgument<Address>("validatorAddress");
+                    var repository = new ValidatorRepository(new World(context.Source.WorldState), new HallowActionContext { });
+                    var delegatee = repository.GetDelegatee(validatorAddress);
+                    var share = repository.GetBond(delegatee, agentAddress).Share;
+
+                    return share.ToString();
+                }
+            );
+
+            Field<ValidatorType>(
+                name: "validator",
+                description: "State for validator.",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "validatorAddress",
+                        Description = "Address of validator."
+                    }
+                ),
+                resolve: context =>
+                {
+                    var validatorAddress = context.GetArgument<Address>("validatorAddress");
+                    var repository = new ValidatorRepository(new World(context.Source.WorldState), new HallowActionContext { });
+                    var delegatee = repository.GetDelegatee(validatorAddress);
+                    return ValidatorType.FromDelegatee(delegatee);
+                }
+            );
+
+            Field<DelegateeRepositoryType>(
+                name: "delegatee",
+                description: "State for delegatee.",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "address",
+                        Description = "Address of the validator."
+                    }
+                ),
+                resolve: context =>
+                {
+                    var address = context.GetArgument<Address>("address");
+                    var guildRepository = new GuildRepository(
+                        new World(context.Source.WorldState), new HallowActionContext { });
+                    var validatorRepository = new ValidatorRepository(
+                        new World(context.Source.WorldState), new HallowActionContext { });
+
+                    if (validatorRepository.TryGetDelegatee(address, out var validatorDelegatee))
+                    {
+                        return new DelegateeRepositoryType
+                        {
+                            GuildDelegatee = DelegateeType.From(guildRepository, address),
+                            ValidatorDelegatee = DelegateeType.From(validatorRepository, address),
+                        };
+                    }
+
+                    return null;
+                }
+            );
+
+            Field<DelegatorRepositoryType>(
+                name: "delegator",
+                description: "State for delegator.",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "address",
+                        Description = "Agent or Validator address."
+                    }
+                ),
+                resolve: context =>
+                {
+                    var address = context.GetArgument<Address>("address");
+                    var agentAddress = new AgentAddress(address);
+                    var guildRepository = new GuildRepository(
+                        new World(context.Source.WorldState), new HallowActionContext { });
+                    var validatorRepository = new ValidatorRepository(
+                        new World(context.Source.WorldState), new HallowActionContext { });
+
+                    if (guildRepository.TryGetGuildParticipant(agentAddress, out var guildParticipant))
+                    {
+                        return DelegatorRepositoryType.From(guildRepository, guildParticipant);
+                    }
+
+                    var validatorAddress = address;
+                    if (validatorRepository.TryGetDelegatee(validatorAddress, out var validatorDelegatee))
+                    {
+                        return DelegatorRepositoryType.From(validatorRepository, validatorAddress);
+                    }
+
+                    return null;
                 }
             );
         }

@@ -1,38 +1,44 @@
-FROM mcr.microsoft.com/dotnet/sdk:6.0-jammy AS build-env
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:8.0 AS build-env
 WORKDIR /app
 ARG COMMIT
-
-# Copy csproj and restore as distinct layers
-COPY ./Lib9c/Lib9c/Lib9c.csproj ./Lib9c/
-COPY ./Libplanet.Headless/Libplanet.Headless.csproj ./Libplanet.Headless/
-COPY ./NineChronicles.RPC.Shared/NineChronicles.RPC.Shared/NineChronicles.RPC.Shared.csproj ./NineChronicles.RPC.Shared/
-COPY ./NineChronicles.Headless/NineChronicles.Headless.csproj ./NineChronicles.Headless/
-COPY ./NineChronicles.Headless.Executable/NineChronicles.Headless.Executable.csproj ./NineChronicles.Headless.Executable/
-RUN dotnet restore Lib9c
-RUN dotnet restore Libplanet.Headless
-RUN dotnet restore NineChronicles.RPC.Shared
-RUN dotnet restore NineChronicles.Headless
-RUN dotnet restore NineChronicles.Headless.Executable
+ARG TARGETPLATFORM
 
 # Copy everything else and build
 COPY . ./
-RUN dotnet publish NineChronicles.Headless.Executable/NineChronicles.Headless.Executable.csproj \
+RUN <<EOF
+#!/bin/bash
+echo "TARGETPLATFROM=$TARGETPLATFORM"
+if [[ "$TARGETPLATFORM" = "linux/amd64" ]]
+then
+  dotnet publish NineChronicles.Headless.Executable/NineChronicles.Headless.Executable.csproj \
     -c Release \
     -r linux-x64 \
     -o out \
     --self-contained \
     --version-suffix $COMMIT
+elif [[ "$TARGETPLATFORM" = "linux/arm64" ]]
+then
+  dotnet publish NineChronicles.Headless.Executable/NineChronicles.Headless.Executable.csproj \
+    -c Release \
+    -r linux-arm64 \
+    -o out \
+    --self-contained \
+    --version-suffix $COMMIT
+else
+  echo "Not supported target platform: '$TARGETPLATFORM'."
+  exit -1
+fi
+EOF
 
 # Build runtime image
-FROM mcr.microsoft.com/dotnet/aspnet:6.0
+FROM --platform=$TARGETPLATFORM mcr.microsoft.com/dotnet/aspnet:8.0-bookworm-slim
 WORKDIR /app
-RUN apt-get update && apt-get install -y libc6-dev
 COPY --from=build-env /app/out .
 
 # Install native deps & utilities for production
 RUN apt-get update \
     && apt-get install -y --allow-unauthenticated \
-        libc6-dev jq curl \
+        libc6-dev liblz4-dev zlib1g-dev libsnappy-dev libzstd-dev jq curl \
      && rm -rf /var/lib/apt/lists/*
 
 VOLUME /data

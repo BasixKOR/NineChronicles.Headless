@@ -13,24 +13,25 @@ namespace NineChronicles.Headless.GraphTypes.States
                 description: "Address of combination slot.",
                 resolve: context => context.Source.address);
             Field<NonNullGraphType<LongGraphType>>(
-                nameof(CombinationSlotState.UnlockBlockIndex),
+                "unlockBlockIndex",
                 description: "Block index at the combination slot can be usable.",
-                resolve: context => context.Source.UnlockBlockIndex);
-#pragma warning disable CS0618
-            Field<NonNullGraphType<IntGraphType>>(
-                nameof(
-                    CombinationSlotState.UnlockStage),
-                description: "Stage id at the combination slot unlock.",
-                resolve: context => context.Source.UnlockStage);
-#pragma warning restore CS0618
+                resolve: context => context.Source.WorkCompleteBlockIndex);
             Field<NonNullGraphType<LongGraphType>>(
-                nameof(CombinationSlotState.StartBlockIndex),
+                "startBlockIndex",
                 description: "Block index at the combination started.",
-                resolve: context => context.Source.StartBlockIndex);
+                resolve: context => context.Source.WorkStartBlockIndex);
             Field<IntGraphType>(
                 nameof(CombinationSlotState.PetId),
                 description: "Pet id used in equipment",
                 resolve: context => context.Source.PetId);
+            Field<NonNullGraphType<IntGraphType>>(
+                nameof(CombinationSlotState.Index),
+                description: "Slot Index at the combination slot",
+                resolve: context => context.Source.Index);
+            Field<NonNullGraphType<BooleanGraphType>>(
+                nameof(CombinationSlotState.IsUnlocked),
+                description: "Is the combination slot unlocked",
+                resolve: context => context.Source.IsUnlocked);
         }
     }
 }

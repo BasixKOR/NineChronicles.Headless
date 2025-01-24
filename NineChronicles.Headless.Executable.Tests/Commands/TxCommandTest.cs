@@ -21,6 +21,7 @@ namespace NineChronicles.Headless.Executable.Tests.Commands
         private readonly StringIOConsole _console;
         private readonly TxCommand _command;
         private readonly PrivateKey _privateKey;
+        private readonly Address _avatarAddress;
         private readonly BlockHash _blockHash;
 
         public TxCommandTest()
@@ -28,21 +29,8 @@ namespace NineChronicles.Headless.Executable.Tests.Commands
             _console = new StringIOConsole();
             _command = new TxCommand(_console);
             _privateKey = new PrivateKey();
+            _avatarAddress = new PrivateKey().Address;
             _blockHash = BlockHash.FromHashDigest(default);
-        }
-
-        [Theory]
-        [InlineData(1)]
-        [InlineData(2)]
-        public void Sign_ActivateAccount(int txNonce)
-        {
-            var nonce = new byte[] { 0x00, 0x01, 0x02, 0x03 };
-            (ActivationKey activationKey, PendingActivationState _) =
-                ActivationKey.Create(_privateKey, nonce);
-            var filePath = Path.Combine(Path.GetTempPath(), Path.GetTempFileName());
-            var actionCommand = new ActionCommand(_console);
-            actionCommand.ActivateAccount(activationKey.Encode(), ByteUtil.Hex(nonce), filePath);
-            Assert_Tx(txNonce, filePath, false);
         }
 
         [Theory]
@@ -68,23 +56,14 @@ namespace NineChronicles.Headless.Executable.Tests.Commands
         {
             var filePath = Path.Combine(Path.GetTempPath(), Path.GetTempFileName());
             var actionCommand = new ActionCommand(_console);
-            actionCommand.Stake(1, filePath);
+            actionCommand.Stake(1, _avatarAddress, filePath);
             Assert_Tx(1, filePath, gas);
         }
 
         [Theory]
-        [InlineData(null, null, false)]
-        [InlineData(0, null, true)]
-        [InlineData(ClaimStakeReward2.ObsoletedIndex - 1, null, false)]
-        [InlineData(ClaimStakeReward2.ObsoletedIndex, null, true)]
-        [InlineData(ClaimStakeReward2.ObsoletedIndex + 1, null, false)]
-        [InlineData(long.MaxValue, null, true)]
-        [InlineData(null, 1, false)]
-        [InlineData(null, 2, true)]
-        [InlineData(null, 3, false)]
-        [InlineData(null, 4, true)]
-        [InlineData(null, 5, false)]
-        public void Sign_ClaimStakeReward(long? blockIndex, int? actionVersion, bool gas)
+        [InlineData(true)]
+        [InlineData(false)]
+        public void Sign_ClaimStakeReward(bool gas)
         {
             var filePath = Path.Combine(Path.GetTempPath(), Path.GetTempFileName());
             var actionCommand = new ActionCommand(_console);

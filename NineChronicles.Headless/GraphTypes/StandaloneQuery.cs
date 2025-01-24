@@ -1,6 +1,7 @@
 #nullable enable
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using Bencodex;
 using Bencodex.Types;
@@ -25,15 +26,21 @@ using Nekoyume.Module;
 using NineChronicles.Headless.GraphTypes.States;
 using NineChronicles.Headless.GraphTypes.Diff;
 using System.Security.Cryptography;
-using System.Text;
+using Libplanet.KeyStore;
+using NineChronicles.Headless.Repositories.BlockChain;
+using NineChronicles.Headless.Repositories.StateTrie;
+using NineChronicles.Headless.Repositories.Transaction;
+using NineChronicles.Headless.Repositories.WorldState;
 using static NineChronicles.Headless.NCActionUtils;
-using Transaction = Libplanet.Types.Tx.Transaction;
+using Block = NineChronicles.Headless.Domain.Model.BlockChain.Block;
 
 namespace NineChronicles.Headless.GraphTypes
 {
     public class StandaloneQuery : ObjectGraphType
     {
-        public StandaloneQuery(StandaloneContext standaloneContext, IConfiguration configuration, ActionEvaluationPublisher publisher, StateMemoryCache stateMemoryCache)
+        private static readonly ActivitySource ActivitySource = new ActivitySource("NineChronicles.Headless.GraphTypes.StandaloneQuery");
+
+        public StandaloneQuery(StandaloneContext standaloneContext, IKeyStore keyStore, IConfiguration configuration, StateMemoryCache stateMemoryCache, IWorldStateRepository worldStateRepository, IBlockChainRepository blockChainRepository, ITransactionRepository transactionRepository, IStateTrieRepository stateTrieRepository)
         {
             bool useSecretToken = configuration[GraphQLService.SecretTokenKey] is { };
             if (Convert.ToBoolean(configuration.GetSection("Jwt")["EnableJwtAuthentication"]))
@@ -54,27 +61,19 @@ namespace NineChronicles.Headless.GraphTypes
                 }),
                 resolve: context =>
                 {
-                    BlockHash blockHash = (context.GetArgument<byte[]?>("hash"), context.GetArgument<long?>("index")) switch
+                    using var activity = ActivitySource.StartActivity("stateQuery");
+                    Block block = (context.GetArgument<byte[]?>("hash"), context.GetArgument<long?>("index")) switch
                     {
-                        ({ } bytes, null) => new BlockHash(bytes),
-                        (null, { } index) => standaloneContext.BlockChain[index].Hash,
+                        ({ } bytes, null) => blockChainRepository.GetBlock(new BlockHash(bytes)),
+                        (null, { } index) => blockChainRepository.GetBlock(index),
                         (not null, not null) => throw new ArgumentException("Only one of 'hash' and 'index' must be given."),
-                        (null, null) => standaloneContext.BlockChain.Tip.Hash,
+                        (null, null) => blockChainRepository.GetTip(),
                     };
-
-                    if (!(standaloneContext.BlockChain is { } chain))
-                    {
-                        return null;
-                    }
-
-                    if (!(blockHash is { } hash))
-                    {
-                        return null;
-                    }
+                    activity?.AddTag("BlockHash", block.Hash.ToString());
 
                     return new StateContext(
-                        chain.GetWorldState(blockHash),
-                        chain[blockHash].Index,
+                        worldStateRepository.GetWorldState(block.StateRootHash),
+                        block.Index,
                         stateMemoryCache
                     );
                 }
@@ -101,13 +100,7 @@ namespace NineChronicles.Headless.GraphTypes
                 ),
                 resolve: context =>
                 {
-                    if (!(standaloneContext.BlockChain is BlockChain blockChain))
-                    {
-                        throw new ExecutionError(
-                            $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!"
-                        );
-                    }
-
+                    using var activity = ActivitySource.StartActivity("diffs");
                     var baseIndex = context.GetArgument<long>("baseIndex");
                     var changedIndex = context.GetArgument<long>("changedIndex");
 
@@ -119,51 +112,66 @@ namespace NineChronicles.Headless.GraphTypes
                         );
                     }
 
-                    var baseBlockStateRootHash = blockChain[baseIndex].StateRootHash.ToString();
-                    var changedBlockStateRootHash = blockChain[changedIndex].StateRootHash.ToString();
+                    var baseBlockStateRootHash = blockChainRepository.GetBlock(baseIndex).StateRootHash.ToString();
+                    var changedBlockStateRootHash = blockChainRepository.GetBlock(changedIndex).StateRootHash.ToString();
 
                     var baseStateRootHash = HashDigest<SHA256>.FromString(baseBlockStateRootHash);
                     var targetStateRootHash = HashDigest<SHA256>.FromString(
                         changedBlockStateRootHash
                     );
 
-                    var stateStore = standaloneContext.StateStore;
-                    var baseTrieModel = stateStore.GetStateRoot(baseStateRootHash);
-                    var targetTrieModel = stateStore.GetStateRoot(targetStateRootHash);
+                    return stateTrieRepository.CompareStateTrie(baseStateRootHash, targetStateRootHash);
+                }
+            );
 
-                    IDiffType[] diffs = baseTrieModel
-                        .Diff(targetTrieModel)
-                        .Select(x =>
-                        {
-                            if (x.TargetValue is not null)
-                            {
-                                var baseSubTrieModel = stateStore.GetStateRoot(new HashDigest<SHA256>((Binary)x.SourceValue));
-                                var targetSubTrieModel = stateStore.GetStateRoot(new HashDigest<SHA256>((Binary)x.TargetValue));
-                                var subDiff = baseSubTrieModel
-                                    .Diff(targetSubTrieModel)
-                                    .Select(diff =>
-                                    {
-                                        return new StateDiffType.Value(
-                                            Encoding.Default.GetString(diff.Path.ByteArray.ToArray()),
-                                            diff.SourceValue,
-                                            diff.TargetValue);
-                                    }).ToArray();
-                                return (IDiffType)new RootStateDiffType.Value(
-                                    Encoding.Default.GetString(x.Path.ByteArray.ToArray()),
-                                    subDiff
-                                );
-                            }
-                            else
-                            {
-                                return new StateDiffType.Value(
-                                    Encoding.Default.GetString(x.Path.ByteArray.ToArray()),
-                                    x.SourceValue,
-                                    x.TargetValue
-                                );
-                            }
-                        }).ToArray();
+            Field<NonNullGraphType<ListGraphType<NonNullGraphType<StateDiffType>>>>(
+                name: "accountDiffs",
+                description: "This field allows you to query the diffs based accountAddress between two blocks." +
+                             " `baseIndex` is the reference block index, and changedIndex is the block index from which to check" +
+                             " what changes have occurred relative to `baseIndex`." +
+                             " Both indices must not be higher than the current block on the chain nor lower than the genesis block index (0)." +
+                             " The difference between the two blocks must be greater than zero for a valid comparison and less than ten for performance reasons.",
+                arguments: new QueryArguments(
+                    new QueryArgument<NonNullGraphType<LongGraphType>>
+                    {
+                        Name = "baseIndex",
+                        Description = "The index of the reference block from which the state is retrieved."
+                    },
+                    new QueryArgument<NonNullGraphType<LongGraphType>>
+                    {
+                        Name = "changedIndex",
+                        Description = "The index of the target block for comparison."
+                    },
+                    new QueryArgument<NonNullGraphType<AddressType>>
+                    {
+                        Name = "accountAddress",
+                        Description = "The target accountAddress."
+                    }
+                ),
+                resolve: context =>
+                {
+                    using var activity = ActivitySource.StartActivity("accountDiffs");
+                    var baseIndex = context.GetArgument<long>("baseIndex");
+                    var changedIndex = context.GetArgument<long>("changedIndex");
+                    var accountAddress = context.GetArgument<Address>("accountAddress");
 
-                    return diffs;
+                    var blockInterval = Math.Abs(changedIndex - baseIndex);
+                    if (blockInterval >= 30 || blockInterval == 0)
+                    {
+                        throw new ExecutionError(
+                            "Interval between baseIndex and changedIndex should not be greater than 30 or zero"
+                        );
+                    }
+
+                    var baseBlockStateRootHash = blockChainRepository.GetBlock(baseIndex).StateRootHash.ToString();
+                    var changedBlockStateRootHash = blockChainRepository.GetBlock(changedIndex).StateRootHash.ToString();
+
+                    var baseStateRootHash = HashDigest<SHA256>.FromString(baseBlockStateRootHash);
+                    var targetStateRootHash = HashDigest<SHA256>.FromString(
+                        changedBlockStateRootHash
+                    );
+
+                    return stateTrieRepository.CompareStateAccountTrie(baseStateRootHash, targetStateRootHash, accountAddress);
                 }
             );
 
@@ -177,25 +185,23 @@ namespace NineChronicles.Headless.GraphTypes
                 ),
                 resolve: context =>
                 {
-                    if (!(standaloneContext.BlockChain is BlockChain blockChain))
-                    {
-                        throw new ExecutionError(
-                            $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!");
-                    }
-
-                    var blockHash = (context.GetArgument<byte[]?>("hash"), context.GetArgument<long?>("index")) switch
+                    using var activity = ActivitySource.StartActivity("state");
+                    var block = (context.GetArgument<byte[]?>("hash"), context.GetArgument<long?>("index")) switch
                     {
                         (not null, not null) => throw new ArgumentException(
                             "Only one of 'hash' and 'index' must be given."),
-                        (null, { } index) => blockChain[index].Hash,
-                        ({ } bytes, null) => new BlockHash(bytes),
-                        (null, null) => blockChain.Tip.Hash,
+                        (null, { } index) => blockChainRepository.GetBlock(index),
+                        ({ } bytes, null) => blockChainRepository.GetBlock(new BlockHash(bytes)),
+                        (null, null) => blockChainRepository.GetTip(),
                     };
                     var accountAddress = context.GetArgument<Address>("accountAddress");
                     var address = context.GetArgument<Address>("address");
 
-                    var state = blockChain
-                        .GetWorldState(blockHash)
+                    activity?
+                        .AddTag("BlockHash", block.Hash.ToString())
+                        .AddTag("Address", address.ToString());
+                    var state = worldStateRepository
+                        .GetWorldState(block.StateRootHash)
                         .GetAccountState(accountAddress)
                         .GetState(address);
 
@@ -221,41 +227,31 @@ namespace NineChronicles.Headless.GraphTypes
                     }
                 ), resolve: context =>
                 {
+                    using var activity = ActivitySource.StartActivity("transferNCGHistories");
                     BlockHash blockHash = new BlockHash(context.GetArgument<byte[]>("blockHash"));
 
-                    if (!(standaloneContext.Store is { } store))
-                    {
-                        throw new InvalidOperationException();
-                    }
+                    activity?.AddTag("BlockHash", blockHash.ToString());
 
-                    if (!(store.GetBlockDigest(blockHash) is { } digest))
-                    {
-                        throw new ArgumentException("blockHash");
-                    }
+                    var block = blockChainRepository.GetBlock(blockHash);
 
                     var recipient = context.GetArgument<Address?>("recipient");
 
-                    IEnumerable<Transaction> blockTxs = digest.TxIds
-                        .Select(bytes => new TxId(bytes))
-                        .Select(txid =>
-                        {
-                            return store.GetTransaction(txid) ??
-                                throw new InvalidOperationException($"Transaction {txid} not found.");
-                        });
-
-                    var filtered = blockTxs
+                    var filtered = block.Transactions
                         .Where(tx => tx.Actions.Count == 1)
+                        .Where(tx =>
+                            tx.Actions[0] is Dictionary dictionary && dictionary.ContainsKey("type_id") &&
+                            dictionary["type_id"] is Text typeId && typeId == TransferAsset.TypeIdentifier)
                         .Select(tx =>
                         (
-                            store.GetTxExecution(blockHash, tx.Id) ??
-                                throw new InvalidOperationException($"TxExecution {tx.Id} not found."),
+                            transactionRepository.GetTxExecution(blockHash, tx.Id) ??
+                            throw new InvalidOperationException($"TxExecution {tx.Id} not found."),
                             ToAction(tx.Actions[0])
                         ))
                         .Where(pair => pair.Item2 is ITransferAsset)
                         .Select(pair => (pair.Item1!, (ITransferAsset)pair.Item2))
                         .Where(pair => !pair.Item1.Fail &&
-                            (!recipient.HasValue || pair.Item2.Recipient == recipient) &&
-                            pair.Item2.Amount.Currency.Ticker == "NCG");
+                                       (!recipient.HasValue || pair.Item2.Recipient == recipient) &&
+                                       pair.Item2.Amount.Currency.Ticker == "NCG");
 
                     var histories = filtered.Select(pair =>
                         new TransferNCGHistory(
@@ -272,36 +268,40 @@ namespace NineChronicles.Headless.GraphTypes
             Field<KeyStoreType>(
                 name: "keyStore",
                 deprecationReason: "Use `planet key` command instead.  https://www.npmjs.com/package/@planetarium/cli",
-                resolve: context => standaloneContext.KeyStore
+                resolve: context => keyStore
             ).AuthorizeWithLocalPolicyIf(useSecretToken);
 
             Field<NonNullGraphType<NodeStatusType>>(
                 name: "nodeStatus",
-                resolve: _ => new NodeStatusType(standaloneContext)
-            );
+                resolve: _ =>
+                {
+                    using var activity = ActivitySource.StartActivity("nodeStatus");
+                    return standaloneContext.NodeStatus;
+                });
 
             Field<NonNullGraphType<Libplanet.Explorer.Queries.ExplorerQuery>>(
                 name: "chainQuery",
                 deprecationReason: "Use /graphql/explorer",
-                resolve: context => new { }
+                resolve: _ => new object()
             );
 
             Field<NonNullGraphType<ValidationQuery>>(
                 name: "validation",
                 description: "The validation method provider for Libplanet types.",
-                resolve: context => new ValidationQuery(standaloneContext));
+                resolve: _ => new object()
+            );
 
             Field<NonNullGraphType<ActivationStatusQuery>>(
                     name: "activationStatus",
                     description: "Check if the provided address is activated.",
                     deprecationReason: "Since NCIP-15, it doesn't care account activation.",
-                    resolve: context => new ActivationStatusQuery(standaloneContext))
+                    resolve: _ => new object())
                 .AuthorizeWithLocalPolicyIf(useSecretToken);
 
             Field<NonNullGraphType<PeerChainStateQuery>>(
                 name: "peerChainState",
                 description: "Get the peer's block chain state",
-                resolve: context => new PeerChainStateQuery(standaloneContext));
+                resolve: _ => new object());
 
             Field<NonNullGraphType<StringGraphType>>(
                 name: "goldBalance",
@@ -311,22 +311,22 @@ namespace NineChronicles.Headless.GraphTypes
                 ),
                 resolve: context =>
                 {
-                    if (!(standaloneContext.BlockChain is BlockChain blockChain))
-                    {
-                        throw new ExecutionError(
-                            $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!");
-                    }
-
+                    using var activity = ActivitySource.StartActivity("goldBalance");
                     Address address = context.GetArgument<Address>("address");
                     byte[] blockHashByteArray = context.GetArgument<byte[]>("hash");
-                    var blockHash = blockHashByteArray is null
-                        ? blockChain.Tip.Hash
-                        : new BlockHash(blockHashByteArray);
+                    var block = blockHashByteArray is null
+                        ? blockChainRepository.GetTip()
+                        : blockChainRepository.GetBlock(new BlockHash(blockHashByteArray));
+                    var worldState = worldStateRepository.GetWorldState(block.StateRootHash);
                     Currency currency = new GoldCurrencyState(
-                        (Dictionary)blockChain.GetWorldState(blockHash).GetLegacyState(GoldCurrencyState.Address)
+                        (Dictionary)worldState
+                            .GetLegacyState(GoldCurrencyState.Address)
                     ).Currency;
 
-                    return blockChain.GetWorldState(blockHash).GetBalance(
+                    activity?
+                        .AddTag("BlockHash", block.Hash.ToString())
+                        .AddTag("Address", address.ToString());
+                    return worldState.GetBalance(
                         address,
                         currency
                     ).GetQuantityString();
@@ -342,14 +342,11 @@ namespace NineChronicles.Headless.GraphTypes
                 ),
                 resolve: context =>
                 {
-                    if (!(standaloneContext.BlockChain is BlockChain blockChain))
-                    {
-                        throw new ExecutionError(
-                            $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!");
-                    }
+                    using var activity = ActivitySource.StartActivity("nextTxNonce");
 
                     Address address = context.GetArgument<Address>("address");
-                    return blockChain.GetNextTxNonce(address);
+                    activity?.AddTag("Address", address.ToString());
+                    return transactionRepository.GetNextTxNonce(address);
                 }
             );
 
@@ -363,14 +360,8 @@ namespace NineChronicles.Headless.GraphTypes
                 ),
                 resolve: context =>
                 {
-                    if (!(standaloneContext.BlockChain is BlockChain blockChain))
-                    {
-                        throw new ExecutionError(
-                            $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!");
-                    }
-
                     var txId = context.GetArgument<TxId>("txId");
-                    return blockChain.GetTransaction(txId);
+                    return transactionRepository.GetTransaction(txId);
                 }
             );
 
@@ -401,6 +392,7 @@ namespace NineChronicles.Headless.GraphTypes
                 description: "Get monster collection status by address.",
                 resolve: context =>
                 {
+                    using var activity = ActivitySource.StartActivity(nameof(MonsterCollectionStatus));
                     if (!(standaloneContext.BlockChain is BlockChain blockChain))
                     {
                         throw new ExecutionError(
@@ -424,9 +416,11 @@ namespace NineChronicles.Headless.GraphTypes
                         agentAddress = (Address)address;
                     }
 
-
-                    BlockHash offset = blockChain.Tip.Hash;
-                    IWorldState worldState = blockChain.GetWorldState(offset);
+                    HashDigest<SHA256> offset = blockChainRepository.GetTip().StateRootHash;
+                    activity?
+                        .AddTag("BlockHash", offset.ToString())
+                        .AddTag("Address", address.ToString());
+                    IWorldState worldState = worldStateRepository.GetWorldState(offset);
 #pragma warning disable S3247
                     if (worldState.GetAgentState(agentAddress) is { } agentState)
 #pragma warning restore S3247
@@ -465,8 +459,11 @@ namespace NineChronicles.Headless.GraphTypes
             Field<NonNullGraphType<TransactionHeadlessQuery>>(
                 name: "transaction",
                 description: "Query for transaction.",
-                resolve: context => new TransactionHeadlessQuery(standaloneContext)
-            );
+                resolve: context =>
+                {
+                    using var activity = ActivitySource.StartActivity("transaction");
+                    return new object();
+                });
 
             Field<NonNullGraphType<BooleanGraphType>>(
                 name: "activated",
@@ -485,13 +482,14 @@ namespace NineChronicles.Headless.GraphTypes
                             $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!");
                     }
 
+                    var worldState = worldStateRepository.GetWorldState(blockChainRepository.GetTip().StateRootHash);
                     string invitationCode = context.GetArgument<string>("invitationCode");
                     ActivationKey activationKey = ActivationKey.Decode(invitationCode);
-                    if (blockChain.GetWorldState().GetLegacyState(activationKey.PendingAddress) is Dictionary dictionary)
+                    if (worldState.GetLegacyState(activationKey.PendingAddress) is Dictionary dictionary)
                     {
                         var pending = new PendingActivationState(dictionary);
-                        ActivateAccount action = activationKey.CreateActivateAccount(pending.Nonce);
-                        if (pending.Verify(action))
+                        var signature = activationKey.PrivateKey.Sign(pending.Nonce);
+                        if (pending.Verify(signature))
                         {
                             return false;
                         }
@@ -514,12 +512,6 @@ namespace NineChronicles.Headless.GraphTypes
                 ),
                 resolve: context =>
                 {
-                    if (!(standaloneContext.BlockChain is { } blockChain))
-                    {
-                        throw new ExecutionError(
-                            $"{nameof(StandaloneContext)}.{nameof(StandaloneContext.BlockChain)} was not set yet!");
-                    }
-
                     ActivationKey activationKey;
                     try
                     {
@@ -531,7 +523,9 @@ namespace NineChronicles.Headless.GraphTypes
                     {
                         throw new ExecutionError("invitationCode format is invalid.");
                     }
-                    if (blockChain.GetWorldState().GetLegacyState(activationKey.PendingAddress) is Dictionary dictionary)
+
+                    var worldState = worldStateRepository.GetWorldState(blockChainRepository.GetTip().StateRootHash);
+                    if (worldState.GetLegacyState(activationKey.PendingAddress) is Dictionary dictionary)
                     {
                         var pending = new PendingActivationState(dictionary);
                         return ByteUtil.Hex(pending.Nonce);
@@ -544,13 +538,17 @@ namespace NineChronicles.Headless.GraphTypes
             Field<NonNullGraphType<RpcInformationQuery>>(
                 name: "rpcInformation",
                 description: "Query for rpc mode information.",
-                resolve: context => new RpcInformationQuery(publisher)
+                resolve: _ => new object()
             );
 
             Field<NonNullGraphType<ActionQuery>>(
                 name: "actionQuery",
                 description: "Query to create action transaction.",
-                resolve: context => new ActionQuery(standaloneContext));
+                resolve: context =>
+                {
+                    using var activity = ActivitySource.StartActivity("actionQuery");
+                    return new object();
+                });
 
             Field<NonNullGraphType<ActionTxQuery>>(
                 name: "actionTxQuery",
@@ -576,12 +574,20 @@ namespace NineChronicles.Headless.GraphTypes
                         DefaultValue = 1 * Currencies.Mead
                     }
                 ),
-                resolve: context => new ActionTxQuery(standaloneContext));
+                resolve: context =>
+                {
+                    using var activity = ActivitySource.StartActivity("actionTxQuery");
+                    return new object();
+                });
 
             Field<NonNullGraphType<AddressQuery>>(
                 name: "addressQuery",
                 description: "Query to get derived address.",
-                resolve: context => new AddressQuery(standaloneContext));
+                resolve: context =>
+                {
+                    using var activity = ActivitySource.StartActivity("addressQuery");
+                    return new object();
+                });
         }
     }
 }

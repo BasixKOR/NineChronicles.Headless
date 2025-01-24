@@ -13,6 +13,7 @@ using Lib9c;
 using Libplanet.Common;
 using Libplanet.Crypto;
 using Libplanet.Types.Assets;
+using Libplanet.Types.Consensus;
 using Libplanet.Types.Tx;
 using Nekoyume;
 using Nekoyume.Action;
@@ -45,6 +46,7 @@ namespace NineChronicles.Headless.Tests.GraphTypes
             new Random().NextBytes(_nonce);
             (_activationKey, PendingActivationState pending) = ActivationKey.Create(_activationCodeSeed, _nonce);
             var initializeStates = new InitializeStates(
+                validatorSet: new ValidatorSet(new List<Validator> { new Validator(MinerPrivateKey.PublicKey, 1) }),
                 rankingState: new RankingState0(),
                 shopState: new ShopState(),
                 gameConfigState: new GameConfigState(),
@@ -67,16 +69,16 @@ namespace NineChronicles.Headless.Tests.GraphTypes
 
         [Theory]
         [ClassData(typeof(StakeFixture))]
-        public async Task Stake(BigInteger amount)
+        public async Task Stake(BigInteger amount, Address avatarAddress)
         {
             string query = $@"
             {{
-                stake(amount: {amount})
+                stake(amount: {amount}, avatarAddress: ""{avatarAddress.ToString()}"")
             }}";
 
             var queryResult = await ExecuteQueryAsync<ActionQuery>(query, standaloneContext: _standaloneContext);
             var data = (Dictionary<string, object>)((ExecutionNode)queryResult.Data!).ToValue()!;
-            ActionBase action = new Stake(amount);
+            ActionBase action = new Stake(amount, avatarAddress);
             var expected = new Dictionary<string, object>()
             {
                 ["stake"] = ByteUtil.Hex(_codec.Encode(action.PlainValue)),
@@ -132,10 +134,12 @@ namespace NineChronicles.Headless.Tests.GraphTypes
                 new object[]
                 {
                     new BigInteger(1),
+                    new Address("0xD84F1893A1912DEC1834A31a43f5619e0b2D5915")
                 },
                 new object[]
                 {
                     new BigInteger(100),
+                    new Address("0x35FdEee2fABE6aa916a36620E104a3E9433E4698")
                 },
             };
 
@@ -582,25 +586,6 @@ namespace NineChronicles.Headless.Tests.GraphTypes
             }
         }
 
-        [Fact]
-        public async Task ActivateAccount()
-        {
-            var activationCode = _activationKey.Encode();
-            var signature = _activationKey.PrivateKey.Sign(_nonce);
-
-            var query = $"{{ activateAccount(activationCode: \"{activationCode}\") }}";
-            var queryResult = await ExecuteQueryAsync<ActionQuery>(query, standaloneContext: _standaloneContext);
-
-            Assert.Null(queryResult.Errors);
-            var data = (Dictionary<string, object>)((ExecutionNode)queryResult.Data!).ToValue()!;
-            var plainValue = _codec.Decode(ByteUtil.ParseHex((string)data["activateAccount"]));
-            Assert.IsType<Dictionary>(plainValue);
-            var actionBase = DeserializeNCAction(plainValue);
-            var action = Assert.IsType<ActivateAccount>(actionBase);
-
-            Assert.Equal(signature, action.Signature);
-        }
-
         [Theory]
         [InlineData(-1, "ab", null, null, null, null, false)]
         [InlineData(0, "ab", null, null, null, null, true)]
@@ -934,6 +919,7 @@ actionPoint: {actionPoint},
             {
                 materialQuery.Append($" \"{materialId}\"");
             }
+
             materialQuery.Append("]");
             var query = $"{{itemEnhancement(avatarAddress: \"{avatarAddress}\", slotIndex: {slotIndex}, " +
                         $"itemId: \"{itemId}\", materialIds: {materialQuery})}}";
@@ -955,9 +941,17 @@ actionPoint: {actionPoint},
         public async Task RapidCombination()
         {
             var avatarAddress = new PrivateKey().Address;
-            var slotIndex = 0;
+            var slotIndexList = new List<int> { 0 };
 
-            var query = $"{{rapidCombination(avatarAddress: \"{avatarAddress}\", slotIndex: {slotIndex})}}";
+            var slotIndexQuery = new StringBuilder("[");
+            foreach (var slotIndex in slotIndexList)
+            {
+                slotIndexQuery.Append($" {slotIndex}");
+            }
+
+            slotIndexQuery.Append("]");
+
+            var query = $"{{rapidCombination(avatarAddress: \"{avatarAddress}\", slotIndexList: {slotIndexQuery})}}";
             var queryResult = await ExecuteQueryAsync<ActionQuery>(query, standaloneContext: _standaloneContext);
             Assert.Null(queryResult.Errors);
 
@@ -967,7 +961,7 @@ actionPoint: {actionPoint},
             var actionBase = DeserializeNCAction(plainValue);
             var action = Assert.IsType<RapidCombination>(actionBase);
             Assert.Equal(avatarAddress, action.avatarAddress);
-            Assert.Equal(slotIndex, action.slotIndex);
+            Assert.Equal(slotIndexList, action.slotIndexList);
         }
 
         [Fact]
@@ -1538,6 +1532,57 @@ actionPoint: {actionPoint},
             var action = Assert.IsType<RetrieveAvatarAssets>(actionBase);
 
             Assert.Equal(avatarAddress, action.AvatarAddress);
+        }
+
+        [Theory]
+        [InlineData(true, true)]
+        [InlineData(true, false)]
+        [InlineData(false, true)]
+        [InlineData(false, false)]
+        public async Task IssueToken(bool favExist, bool itemExist)
+        {
+            var avatarAddress = new PrivateKey().Address;
+            var fungibleAssetValues = favExist
+                ? "[{ticker: \"CRYSTAL\", decimalPlaces: 18, quantity: 100}]"
+                : "[]";
+            var items = itemExist
+                ? "[{itemId: 500000, count: 100, tradable: true}, {itemId: 500000, count: 100, tradable: false}]"
+                : "[]";
+            var query = $@"{{
+                issueToken(
+                    avatarAddress: ""{avatarAddress}"",
+                    fungibleAssetValues: {fungibleAssetValues},
+                    items: {items}
+                )
+            }}";
+
+            var queryResult = await ExecuteQueryAsync<ActionQuery>(query, standaloneContext: _standaloneContext);
+            var data = (Dictionary<string, object>)((ExecutionNode)queryResult.Data!).ToValue()!;
+            var plainValue = _codec.Decode(ByteUtil.ParseHex((string)data["issueToken"]));
+            Assert.IsType<Dictionary>(plainValue);
+            var actionBase = DeserializeNCAction(plainValue);
+            var action = Assert.IsType<IssueToken>(actionBase);
+
+            Assert.Equal(avatarAddress, action.AvatarAddress);
+            Assert.Equal(favExist, action.FungibleAssetValues.Any());
+            Assert.Equal(itemExist, action.Items.Any());
+
+            if (favExist)
+            {
+                var fav = action.FungibleAssetValues.First();
+                Assert.Equal(Currencies.Crystal * 100, fav);
+            }
+
+            if (itemExist)
+            {
+                for (int i = 0; i < action.Items.Count; i++)
+                {
+                    var (itemId, count, tradable) = action.Items[i];
+                    Assert.Equal(500000, itemId);
+                    Assert.Equal(100, count);
+                    Assert.Equal(i == 0, tradable);
+                }
+            }
         }
     }
 }

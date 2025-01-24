@@ -12,7 +12,6 @@ using NineChronicles.Headless.Executable.Commands;
 using NineChronicles.Headless.Executable.IO;
 using NineChronicles.Headless.Properties;
 using Org.BouncyCastle.Security;
-using Sentry;
 using Serilog;
 using Serilog.Formatting.Compact;
 using System;
@@ -25,6 +24,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Runtime;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -32,7 +32,6 @@ using System.Threading.Tasks;
 using Lib9c.DevExtensions.Action.Loader;
 using Libplanet.Action;
 using Libplanet.Action.Loader;
-// import necessary for sentry exception filters
 using Libplanet.Types.Blocks;
 using Libplanet.Headless;
 using Libplanet.Headless.Hosting;
@@ -41,6 +40,8 @@ using Nekoyume.Action.Loader;
 using OpenTelemetry;
 using OpenTelemetry.Metrics;
 using Nekoyume;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 namespace NineChronicles.Headless.Executable
 {
@@ -208,29 +209,20 @@ namespace NineChronicles.Headless.Executable
             [Option("consensus-propose-second-base",
                 Description = "A propose second base for consensus context timeout. The unit is second.")]
             int? consensusProposeSecondBase = null,
+            [Option("consensus-enter-precommit-delay",
+                Description = "A precommit delay manually set. The unit is millisecond.")]
+            int? consensusEnterPreCommitDelay = null,
             [Option("maximum-transaction-per-block",
                 Description = "Maximum transactions allowed in a block. null by default.")]
             int? maxTransactionPerBlock = null,
             [Option("config", new[] { 'C' },
                 Description = "Absolute path of \"appsettings.json\" file to provide headless configurations.")]
             string? configPath = "appsettings.json",
-            [Option(Description = "Sentry DSN")]
-            string? sentryDsn = "",
-            [Option(Description = "Trace sample rate for sentry")]
-            double? sentryTraceSampleRate = null,
-            [Option(Description = "arena participants list sync interval time")]
-            int? arenaParticipantsSyncInterval = null,
-            [Option(Description = "arena participants list sync enable")]
-            bool arenaParticipantsSync = true,
             [Option(Description = "[DANGER] Turn on RemoteKeyValueService to debug.")]
             bool remoteKeyValueService = false,
             [Ignore] CancellationToken? cancellationToken = null
         )
         {
-#if SENTRY || ! DEBUG
-            try
-            {
-#endif
             var configurationBuilder = new ConfigurationBuilder();
             if (Uri.IsWellFormedUriString(configPath, UriKind.Absolute))
             {
@@ -301,48 +293,56 @@ namespace NineChronicles.Headless.Executable
                 GetActionEvaluatorConfiguration(configuration.GetSection("Headless").GetSection("ActionEvaluator"));
 
             headlessConfig.Overwrite(
-                appProtocolVersionToken, trustedAppProtocolVersionSigners, genesisBlockPath, host, port,
-                swarmPrivateKeyString, storeType, storePath, noReduceStore, noMiner, minerCount,
-                minerPrivateKeyString, minerBlockIntervalMilliseconds, planet, iceServerStrings, peerStrings, rpcServer, rpcListenHost,
-                rpcListenPort, rpcRemoteServer, rpcHttpServer, graphQLServer, graphQLHost, graphQLPort,
-                graphQLSecretTokenPath, noCors, nonblockRenderer, nonblockRendererQueue, strictRendering,
-                logActionRenders, confirmations,
-                txLifeTime, messageTimeout, tipTimeout, demandBuffer, skipPreload,
-                minimumBroadcastTarget, bucketSize, chainTipStaleBehaviorType, txQuotaPerSigner, maximumPollPeers,
-                consensusPort, consensusPrivateKeyString, consensusSeedStrings, consensusTargetBlockIntervalMilliseconds, consensusProposeSecondBase,
-                maxTransactionPerBlock, sentryDsn, sentryTraceSampleRate, arenaParticipantsSyncInterval, remoteKeyValueService
+                appProtocolVersionToken,
+                trustedAppProtocolVersionSigners,
+                genesisBlockPath,
+                host,
+                port,
+                swarmPrivateKeyString,
+                storeType,
+                storePath,
+                noReduceStore,
+                noMiner,
+                minerCount,
+                minerPrivateKeyString,
+                minerBlockIntervalMilliseconds,
+                planet,
+                iceServerStrings,
+                peerStrings,
+                rpcServer,
+                rpcListenHost,
+                rpcListenPort,
+                rpcRemoteServer,
+                rpcHttpServer,
+                graphQLServer,
+                graphQLHost,
+                graphQLPort,
+                graphQLSecretTokenPath,
+                noCors,
+                nonblockRenderer,
+                nonblockRendererQueue,
+                strictRendering,
+                logActionRenders,
+                confirmations,
+                txLifeTime,
+                messageTimeout,
+                tipTimeout,
+                demandBuffer,
+                skipPreload,
+                minimumBroadcastTarget,
+                bucketSize,
+                chainTipStaleBehaviorType,
+                txQuotaPerSigner,
+                maximumPollPeers,
+                consensusPort,
+                consensusPrivateKeyString,
+                consensusSeedStrings,
+                consensusTargetBlockIntervalMilliseconds,
+                consensusProposeSecondBase * 1_000,
+                consensusEnterPreCommitDelay,
+                maxTransactionPerBlock,
+                remoteKeyValueService
             );
-
-#if SENTRY || ! DEBUG
-            loggerConf = loggerConf
-                .WriteTo.Sentry(o =>
-                {
-                    o.InitializeSdk = false;
-                });
-
-            using var _ = SentrySdk.Init(o =>
-            {
-                o.SendDefaultPii = true;
-                o.Dsn = headlessConfig.SentryDsn;
-                // TODO: We need to specify `o.Release` after deciding the version scheme.
-                // https://docs.sentry.io/workflow/releases/?platform=csharp
-                //o.Debug = true;
-                o.Release = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()
-                    ?.InformationalVersion ?? "Unknown";
-                o.SampleRate = 0.01f;
-                o.TracesSampleRate = headlessConfig.SentryTraceSampleRate;
-                o.AddExceptionFilterForType<TimeoutException>();
-                o.AddExceptionFilterForType<IOException>();
-                o.AddExceptionFilterForType<CommunicationFailException>();
-                o.AddExceptionFilterForType<InvalidBlockIndexException>();
-            });
-
-            // Set global tag
-            SentrySdk.ConfigureScope(scope =>
-            {
-                scope.SetTag("host", headlessConfig.Host ?? "no-host");
-            });
-#endif
 
             // Clean-up previous temporary log files.
             if (Directory.Exists("_logs"))
@@ -351,6 +351,8 @@ namespace NineChronicles.Headless.Executable
             }
 
             Log.Logger = loggerConf.CreateLogger();
+
+            Log.Information("The {0} garbage collector is running.", GCSettings.IsServerGC ? "server" : "workstation");
 
             if (!headlessConfig.NoMiner && headlessConfig.MinerPrivateKeyString is null)
             {
@@ -371,6 +373,7 @@ namespace NineChronicles.Headless.Executable
             try
             {
                 IHostBuilder hostBuilder = Host.CreateDefaultBuilder();
+                hostBuilder.ConfigureAppConfiguration(builder => builder.AddConfiguration(configuration));
 
                 var standaloneContext = new StandaloneContext
                 {
@@ -406,7 +409,8 @@ namespace NineChronicles.Headless.Executable
                         consensusPrivateKeyString: headlessConfig.ConsensusPrivateKeyString,
                         consensusSeedStrings: headlessConfig.ConsensusSeedStrings,
                         consensusTargetBlockIntervalMilliseconds: headlessConfig.ConsensusTargetBlockIntervalMilliseconds,
-                        consensusProposeSecondBase: headlessConfig.ConsensusProposeSecondBase,
+                        consensusProposeTimeoutBase: headlessConfig.ConsensusProposeTimeoutBase,
+                        consensusEnterPreCommitDelay: headlessConfig.ConsensusEnterPreCommitDelay,
                         maximumPollPeers: headlessConfig.MaximumPollPeers,
                         actionEvaluatorConfiguration: actionEvaluatorConfiguration
                     );
@@ -474,21 +478,44 @@ namespace NineChronicles.Headless.Executable
                         MaxTransactionPerBlock = headlessConfig.MaxTransactionPerBlock
                     };
                 var arenaMemoryCache = new StateMemoryCache();
+                string otlpEndpoint = Environment.GetEnvironmentVariable("OTLP_ENDPOINT") ?? "http://localhost:4317";
                 hostBuilder.ConfigureServices(services =>
                 {
                     services.AddSingleton(_ => standaloneContext);
-                    services.AddSingleton<ConcurrentDictionary<string, ITransaction>>();
+                    services.AddSingleton<IKeyStore>(standaloneContext.KeyStore);
                     services.AddOpenTelemetry()
+                        .ConfigureResource(resource => resource.AddService(
+                                serviceName: Assembly.GetEntryAssembly()?.GetName().Name ?? "NineChronicles.Headless",
+                                serviceVersion: Assembly.GetEntryAssembly()?.GetName().Version?.ToString(),
+                                serviceInstanceId: Environment.MachineName
+                            ).AddAttributes(new Dictionary<string, object>
+                            {
+                                { "deployment.environment", Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Unknown" },
+                            }))
                         .WithMetrics(
                             builder => builder
                                 .AddMeter("NineChronicles")
-                                .AddPrometheusExporter());
+                                .AddMeter("MagicOnion.Server")
+                                .AddAspNetCoreInstrumentation()
+                                .AddRuntimeInstrumentation()
+                                .AddPrometheusExporter())
+                        .WithTracing(
+                            builder => builder
+                                .AddSource("Lib9c.Action.HackAndSlash")
+                                .AddSource("Libplanet.Action.State")
+                                .AddSource("Libplanet.Blockchain.BlockChainStates")
+                                .AddSource("NineChronicles.Headless.GraphTypes.StandaloneQuery")
+                                .AddSource("NineChronicles.Headless.GraphTypes.StandaloneMutation")
+                                .AddSource("NineChronicles.Headless.GraphTypes.TransactionHeadlessQuery")
+                                .AddAspNetCoreInstrumentation()
+                                .AddGrpcClientInstrumentation()
+                                .AddProcessor(new Pyroscope.OpenTelemetry.PyroscopeSpanProcessor())
+                                .AddOtlpExporter(opt =>
+                                {
+                                    opt.Endpoint = new Uri(otlpEndpoint, UriKind.Absolute);
+                                })
+                        );
 
-                    // worker
-                    if (arenaParticipantsSync)
-                    {
-                        services.AddHostedService(_ => new ArenaParticipantsWorker(arenaMemoryCache, standaloneContext, headlessConfig.ArenaParticipantsSyncInterval));
-                    }
                     services.AddSingleton(arenaMemoryCache);
                 });
 
@@ -516,7 +543,6 @@ namespace NineChronicles.Headless.Executable
                         IPAddress.Loopback.ToString(),
                         rpcProperties.RpcListenPort,
                         context,
-                        new ConcurrentDictionary<string, Sentry.ITransaction>(),
                         arenaMemoryCache
                     );
 
@@ -547,7 +573,6 @@ namespace NineChronicles.Headless.Executable
                         IPAddress.Loopback.ToString(),
                         0,
                         context,
-                        new ConcurrentDictionary<string, Sentry.ITransaction>(),
                         arenaMemoryCache
                     );
                     hostBuilder.UseNineChroniclesNode(
@@ -598,23 +623,6 @@ namespace NineChronicles.Headless.Executable
             {
                 Log.Error(e, "Unexpected exception occurred during Run. {e}", e);
             }
-
-#if SENTRY || ! DEBUG
-            }
-            catch (CommandExitedException)
-            {
-                throw;
-            }
-            catch (Exception exceptionToCapture)
-            {
-                SentrySdk.CaptureException(exceptionToCapture);
-                throw;
-            }
-#endif
-        }
-
-        static void ConfigureSentryOptions(SentryOptions o)
-        {
         }
     }
 }
